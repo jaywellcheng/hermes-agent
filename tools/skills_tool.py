@@ -712,16 +712,15 @@ def skill_view(
             result["metadata"] = metadata
 
         # ── Skill usage 采集（2026-08-06 治理 PRD 工作流 2 接通）──
-        # 断点修复: log_skill_usage.py 创建后从未被调用（memory_usage.db 仅 1 条）
-        # 失败不阻断主流程; 链路失效由 skill-usage-audit 每日告警兜底（U3）
+        # MOJ-1521 加固: 尊重 HERMES_HOME；失败必须 WARNING 留痕，不得静默丢失。
         try:
-            import sqlite3 as _sq, pathlib as _pl
-            _c = _sq.connect(str(_pl.Path.home() / ".hermes" / "memory_usage.db"))
+            import sqlite3 as _sq
+            _c = _sq.connect(str(get_hermes_home() / "memory_usage.db"))
             _c.execute("INSERT INTO skill_views (skill_name) VALUES (?)", (name,))
             _c.commit()
             _c.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Skill usage ledger write failed for %s: %s", name, exc)
 
         return _json(result)
     except Exception as e:

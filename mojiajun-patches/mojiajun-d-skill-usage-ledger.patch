@@ -1,0 +1,23 @@
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index 9828e4c3f2..fe6e3e8c30 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -649,6 +649,18 @@ def skill_view(
+             result["compatibility"] = frontmatter["compatibility"]
+         if isinstance(metadata, dict):
+             result["metadata"] = metadata
++
++        # ── Skill usage 采集（2026-08-06 治理 PRD 工作流 2 接通）──
++        # MOJ-1521 加固: 尊重 HERMES_HOME；失败必须 WARNING 留痕，不得静默丢失。
++        try:
++            import sqlite3 as _sq
++            _c = _sq.connect(str(get_hermes_home() / "memory_usage.db"))
++            _c.execute("INSERT INTO skill_views (skill_name) VALUES (?)", (name,))
++            _c.commit()
++            _c.close()
++        except Exception as exc:
++            logger.warning("Skill usage ledger write failed for %s: %s", name, exc)
++
+         return _json(result)
+     except Exception as e:
+         return tool_error(str(e), success=False)
