@@ -650,7 +650,7 @@ def _set_plugin_enabled(name: str, *, enable: bool, aliases=(), console=None) ->
         _apply_activation(enabled, disabled, name, aliases, enable=enable)
         _admit_and_save_plugin_sets(enabled, disabled, console=console,
                                    action=f"{'Enable' if enable else 'Disable'} '{name}'",
-                                   expected_config=expected_config, plugin=name if enable else None,
+                                   expected_config=expected_config, plugin=name,
                                    settled=(name, *aliases))
 
 

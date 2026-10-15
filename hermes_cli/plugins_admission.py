@@ -74,6 +74,7 @@ def admit_plugin_set_change(
             "disabled": sorted(candidate_disabled), "extra_dirs": [str(Path(d).resolve()) for d in extra_dirs],
             "settled": sorted(settled),
             **({"expected_config": expected_config} if expected_config is not None else {}),
+            **({"target": plugin} if plugin is not None else {}),
         }))
     except Exception as exc:
         from pm.workspace import ResolutionConflict

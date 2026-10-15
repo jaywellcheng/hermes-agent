@@ -79,6 +79,45 @@ def _admitted(source: Path, *, new: bool) -> bool:
     return not core_requirement_error(declaration)
 
 
+def _assert_plugin_delta(selection: dict, previous: bytes | None, proposed: bytes) -> None:
+    """Reject a write that changes either selection list by more than its requested key."""
+    import sys
+
+    from hermes_yaml import roundtrip_yaml
+
+    yaml = roundtrip_yaml()
+
+    def lists(data: bytes | None) -> tuple[set[str], set[str], set[str]]:
+        config = yaml.load((data or b"").decode("utf-8-sig")) or {}
+        plugins = config.get("plugins") or {}
+        enabled = {str(item) for item in plugins.get("enabled") or []}
+        disabled = {str(item) for item in plugins.get("disabled") or []}
+        return enabled, disabled, enabled & disabled
+
+    enabled_before, disabled_before, _ = lists(previous)
+    enabled_after, disabled_after, overlap = lists(proposed)
+    # A caller that names no target is an explicit full-state publication: validate
+    # self-consistency, but do not infer a single-key delta it never requested.
+    intended = {str(selection["target"])} if selection.get("target") is not None else None
+    problems = []
+    if intended is not None and disabled_after - disabled_before - intended:
+        problems.append(f"disabled gained {sorted(disabled_after - disabled_before - intended)}")
+    if intended is not None and enabled_before - enabled_after - intended:
+        problems.append(f"enabled lost {sorted(enabled_before - enabled_after - intended)}")
+    if overlap:
+        problems.append(f"enabled and disabled intersect at {sorted(overlap)}")
+    if problems:
+        message = ("Refused plugin selection write with unexpected delta at "
+                   f"{selection['home']}/config.yaml: {'; '.join(problems)}")
+        print(f"\u26a0 {message}", file=sys.stderr, flush=True)
+        try:
+            from pm import receipt
+            receipt.record_warning(message)
+        except Exception:
+            pass
+        raise ValueError(message)
+
+
 class PluginSelection:
     def __init__(self, selection: dict):
         from hermes_yaml import roundtrip_yaml
@@ -109,6 +148,7 @@ class PluginSelection:
         output = io.StringIO()
         yaml.dump(config, output)
         self.proposed = output.getvalue().encode("utf-8")
+        _assert_plugin_delta(selection, self.previous, self.proposed)
         self.members = candidate_members(selection.get("extra_dirs", ()), proposed_home=self.home,
                                          enabled=selection["enabled"], disabled=selection["disabled"])
 
