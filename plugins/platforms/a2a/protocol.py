@@ -335,10 +335,13 @@ class TaskStore:
                 "createdAt": rec.get("created_iso", ""), "pushNotificationConfig": {"url": rec.get("push_url") or ""}}
 
     def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "",
-               input_id: str = "") -> dict:
+               input_id: str = "", metadata: dict | None = None) -> dict:
         """``input_id``: the owner admission a forwarded task was sent as (empty for local tasks)."""
+        # Inbound metadata is peer-controlled; persist only the safe tracing allowlist.
+        safe_metadata = {k: v for k in ("issue_id", "round", "trace_id")
+                         if isinstance(metadata, dict) and (v := metadata.get(k)) is not None}
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
-               "input_id": input_id, "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
+               "input_id": input_id, "metadata": safe_metadata or None, "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
         with self._lock:
             self._tasks[task_id] = rec
         return dict(rec)
@@ -442,6 +445,8 @@ class TaskStore:
                           created_at=rec.get("created_iso", ""))
         if not include_artifacts:
             task.pop("artifacts", None)
+        if rec.get("metadata"):
+            task["metadata"] = rec["metadata"]
         return task
 
 

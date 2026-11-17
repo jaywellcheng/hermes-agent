@@ -18,7 +18,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import OrderedDict, deque
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
@@ -313,6 +313,8 @@ class A2AAdapter(BasePlatformAdapter):
         # Admission ids this process already forwarded; a resend of one is a retry, not a new turn.
         self._forwarded_inputs: OrderedDict[str, None] = OrderedDict()
         self._pending_lock = threading.Lock()
+        # Detached finalization owns persistent task state; HTTP observer threads only write SSE.
+        self._finalize_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="a2a-finalize")
 
     @property
     def name(self) -> str:
@@ -367,6 +369,38 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending.clear()
             self._pending_order.clear()
             self._active_tasks.clear()
+        self._finalize_executor.shutdown(wait=False)
+
+    def _arm_detached_finalize(self, pending: dict) -> Future:
+        """Own finalization for ``pending`` off the HTTP thread; exactly once (I2)."""
+        settled: Future = pending.setdefault("settled", Future())
+        fut = pending["future"]
+
+        def _run(state: str, reply: str) -> None:
+            try:
+                out = self._finalize_task(pending, state, reply)
+            except Exception:
+                logger.exception("A2A: detached finalize failed for %s", pending["task_id"])
+                out = (state, reply)
+            if not settled.done():
+                settled.set_result(out)
+
+        def _on_done(_fut: Future) -> None:
+            timer.cancel()
+            try:
+                state, reply = fut.result()
+            except Exception:
+                state, reply = protocol.STATE_FAILED, "[agent processing failed]"
+            # _record_outcome performs a synchronous push POST; keep it off the gateway loop (I5).
+            self._finalize_executor.submit(_run, state, reply)
+
+        timer = threading.Timer(_reply_timeout(), lambda: self._resolve_task(
+            pending["task_id"], protocol.STATE_FAILED, "[agent did not reply in time]"))  # I4
+        timer.daemon = True
+        timer.start()
+        pending["_detach_timer"] = timer
+        fut.add_done_callback(_on_done)
+        return settled
 
     def _watchdog_loop(self) -> None:
         """Background thread that fails orphaned tasks (keeps them queryable)."""
@@ -582,7 +616,8 @@ class A2AAdapter(BasePlatformAdapter):
         turn = 0 if retry else self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent),
-                                input_id=(input_id or task_id) if forwarded else "")
+                                input_id=(input_id or task_id) if forwarded else "",
+                                metadata=params.get("metadata"))
         if not retry and (turn > max_turns or not text):
             self._forget_forwarded_input(input_id)
         if turn > max_turns:
@@ -677,7 +712,7 @@ class A2AAdapter(BasePlatformAdapter):
             self._pop_pending(task_id)
 
     @staticmethod
-    def _await_future(fut: Future, deadline: float, keepalive, on_timeout: tuple[str, str]) -> tuple[str, str]:
+    def _await_future(fut: Future, deadline: float, keepalive, on_timeout: tuple[str, str]) -> tuple[str, str] | None:
         """Block until ``fut`` resolves or ``deadline`` passes (-> ``on_timeout``). ``keepalive`` runs
         every _SSE_KEEPALIVE seconds while waiting; if it raises, the client is gone and we stop."""
         while True:
@@ -689,12 +724,14 @@ class A2AAdapter(BasePlatformAdapter):
                 if keepalive:
                     try:
                         keepalive()
-                    except Exception:
-                        return (protocol.STATE_FAILED, "[client disconnected]")
-            except Exception:
+                    except Exception as exc:
+                        logger.debug("A2A: SSE observer disconnected: %r", exc)
+                        return None
+            except Exception as exc:
+                logger.debug("A2A: reply future failed: %r", exc)
                 return on_timeout
 
-    def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
+    def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str] | None:
         return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
                                   (protocol.STATE_FAILED, "[agent did not reply in time]"))
 
@@ -743,16 +780,24 @@ class A2AAdapter(BasePlatformAdapter):
                 return self._emit_terminal(handler, terminal["id"], terminal["contextId"], terminal["status"]["state"],
                                            protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}), req_id=req_id)
             task_id, context_id = pending["task_id"], pending["context_id"]
+            settled = self._arm_detached_finalize(pending)  # arm before the first observer write can fail
             submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
             self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
-            state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
+            observed = self._await_reply(pending, keepalive=self._keepalive(handler))
+            if observed is None:
+                pending = None  # finalizer owns terminal state (I1/I2)
+                return
+            state, reply = settled.result(timeout=_reply_timeout() + 30)
             pending = None
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             if pending is not None:
-                self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
-            logger.debug("A2A: stream client disconnected")
+                self._arm_detached_finalize(pending)  # do not fabricate FAILED
+            logger.debug("A2A: stream client disconnected", exc_info=True)
+        finally:
+            if pending is not None and (timer := pending.get("_detach_timer")):
+                timer.cancel()
 
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:
         """Reconnect to an existing task's stream (v1.0 SubscribeToTask)."""
@@ -765,6 +810,8 @@ class A2AAdapter(BasePlatformAdapter):
                 return self._sse_write(handler, protocol.sse_done())
             state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
                                               (rec["state"], rec.get("reply", "")))
+            if state is None:
+                return
             self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: subscribe client disconnected")

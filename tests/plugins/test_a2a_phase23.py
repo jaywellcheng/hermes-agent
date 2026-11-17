@@ -545,17 +545,8 @@ class TestTaskStore:
         assert result == [(protocol.STATE_COMPLETED, "reply")]
         assert adapter.tasks.get("t-live")["state"] == protocol.STATE_COMPLETED
 
-    def test_stream_disconnect_releases_active_request(self, monkeypatch):
-        adapter, _base = _make_live_adapter(monkeypatch)
-        rec = adapter.tasks.create("t-live", "c1", "peer")
-        adapter.tasks.set_state("t-live", protocol.STATE_WORKING)
-        pending = {
-            "task_id": "t-live", "context_id": "c1", "peer": "peer",
-            "future": adapter._add_pending("t-live", "c1"),
-            "created_iso": rec["created_iso"], "started": time.time(),
-        }
-        monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
-
+    @staticmethod
+    def _broken_stream_handler():
         class BrokenWriter:
             def write(self, _chunk):
                 raise BrokenPipeError
@@ -572,13 +563,84 @@ class TestTaskStore:
             def end_headers(self):
                 pass
 
-        adapter._rpc_message_stream(Handler(), 1, {}, "peer")
+        return Handler()
 
+    @staticmethod
+    def _stream_pending(adapter, rec):
+        adapter.tasks.set_state(rec["task_id"], protocol.STATE_WORKING)
+        return {
+            "task_id": rec["task_id"], "context_id": rec["context_id"], "peer": "peer",
+            "future": adapter._add_pending(rec["task_id"], rec["context_id"]),
+            "created_iso": rec["created_iso"], "started": time.time(),
+        }
+
+    def _observe_disconnect(self, adapter, monkeypatch, task_id):
+        pending = self._stream_pending(adapter, adapter.tasks._tasks[task_id])
+        monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
+        adapter._rpc_message_stream(self._broken_stream_handler(), 1, {}, "peer")
+        return pending
+
+    def test_stream_observer_gone_does_not_fabricate_failed(self, monkeypatch):
+        adapter, _base = _make_live_adapter(monkeypatch)
+        adapter.tasks.create("t-live", "c1", "peer")
+        pending = self._observe_disconnect(adapter, monkeypatch, "t-live")
         stored = adapter.tasks.get("t-live")
-        assert stored["state"] == protocol.STATE_FAILED
-        assert stored["reply"] == "[client disconnected]"
+        assert stored["state"] == protocol.STATE_WORKING
+        assert stored["reply"] != "[client disconnected]"
+        assert "t-live" in adapter._pending and "t-live" in adapter._active_tasks
+        assert not pending["settled"].done()
+        pending["future"].set_result((protocol.STATE_COMPLETED, "late"))
+        assert pending["settled"].result(timeout=1) == (protocol.STATE_COMPLETED, "late")
+
+    def test_stream_disconnect_keeps_task_alive_and_records_reply(self, monkeypatch):
+        adapter, _base = _make_live_adapter(monkeypatch)
+        adapter.tasks.create("t-live", "c1", "peer")
+        pending = self._observe_disconnect(adapter, monkeypatch, "t-live")
+        pending["future"].set_result((protocol.STATE_COMPLETED, "real answer"))
+        assert pending["settled"].result(timeout=1) == (protocol.STATE_COMPLETED, "real answer")
+        stored = adapter.tasks.get("t-live")
+        assert stored["state"] == protocol.STATE_COMPLETED
+        assert stored["reply"] == "real answer"
+        entries = protocol.load_conversation("c1", limit=0)
+        assert entries[-1]["role"] == "agent" and entries[-1]["text"] == "real answer"
         assert "t-live" not in adapter._pending
         assert "t-live" not in adapter._active_tasks
+        pending["_detach_timer"].cancel()
+
+    def test_detached_orphan_timeout_still_bounded(self, monkeypatch):
+        adapter, _base = _make_live_adapter(monkeypatch)
+        adapter.tasks.create("t-live", "c1", "peer")
+        pending = self._stream_pending(adapter, adapter.tasks._tasks["t-live"])
+        monkeypatch.setattr("plugins.platforms.a2a.adapter._reply_timeout", lambda: 0.05)
+        adapter._arm_detached_finalize(pending)
+        assert pending["settled"].result(timeout=1) == (
+            protocol.STATE_FAILED, "[agent did not reply in time]")
+        stored = adapter.tasks.get("t-live")
+        assert stored["state"] == protocol.STATE_FAILED
+        assert stored["reply"] == "[agent did not reply in time]"
+        assert "t-live" not in adapter._pending
+        assert "t-live" not in adapter._active_tasks
+
+    def test_detached_finalize_runs_once(self, monkeypatch):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        adapter, _base = _make_live_adapter(monkeypatch)
+        adapter.tasks.create("t-once", "c1", "peer")
+        pending = self._stream_pending(adapter, adapter.tasks._tasks["t-once"])
+        calls = []
+        original = A2AAdapter._finalize_task
+        monkeypatch.setattr(A2AAdapter, "_finalize_task",
+                            lambda self, p, state, reply: calls.append((state, reply)) or original(self, p, state, reply))
+        settled = adapter._arm_detached_finalize(pending)
+        pending["future"].set_result((protocol.STATE_COMPLETED, "reply"))
+        adapter._resolve_task("t-once", protocol.STATE_FAILED, "late")
+        assert settled.result(timeout=1) == (protocol.STATE_COMPLETED, "reply")
+        assert calls == [(protocol.STATE_COMPLETED, "reply")]
+
+    def test_tasks_get_returns_inbound_metadata(self, monkeypatch):
+        adapter, _base = _make_live_adapter(monkeypatch)
+        rec = adapter.tasks.create("t-meta", "c1", "peer", metadata={"issue_id": "MOJ-2246", "private": "no"})
+        task = adapter.tasks.to_task(rec)
+        assert task["metadata"] == {"issue_id": "MOJ-2246"}
 
     def test_list_newest_first_with_filters(self):
         store = protocol.TaskStore()
